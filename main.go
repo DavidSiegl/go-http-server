@@ -23,6 +23,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	jwt_secret     string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -118,9 +119,23 @@ func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing or invalid token"})
+		return
+	}
+	userID, err := auth.ValidateJWT(tokenString, cfg.jwt_secret)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid token"})
+		return
+	}
+
 	var req struct {
-		Body   string    `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Body == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -148,7 +163,7 @@ func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request)
 
 	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   cleanedBody,
-		UserID: req.UserID,
+		UserID: userID,
 	})
 	if err != nil {
 		log.Printf("createChirp error: %v", err)
@@ -239,14 +254,87 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	accessToken, err := auth.MakeJWT(user.ID, cfg.jwt_secret, time.Hour)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not create access token"})
+		return
+	}
+
+	rawRefresh, err := auth.MakeRefreshToken()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not create refresh token"})
+		return
+	}
+
+	_, err = cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     rawRefresh,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().UTC().Add(60 * 24 * time.Hour),
+	})
+	if err != nil {
+		log.Printf("createRefreshToken error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not store refresh token"})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":         user.ID,
-		"email":      user.Email,
-		"created_at": user.CreatedAt,
-		"updated_at": user.UpdatedAt,
+		"id":            user.ID,
+		"created_at":    user.CreatedAt,
+		"updated_at":    user.UpdatedAt,
+		"email":         user.Email,
+		"token":         accessToken,
+		"refresh_token": rawRefresh,
 	})
+}
+
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	user, err := cfg.db.GetUserFromRefreshToken(r.Context(), tokenString)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(user.ID, cfg.jwt_secret, time.Hour)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not create access token"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{"token": accessToken})
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if err := cfg.db.RevokeRefreshToken(r.Context(), tokenString); err != nil {
+		log.Printf("revokeRefreshToken error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
@@ -268,8 +356,9 @@ func main() {
 	const port = "8080"
 
 	cfg := &apiConfig{
-		db:       database.New(db),
-		platform: os.Getenv("PLATFORM"),
+		db:         database.New(db),
+		platform:   os.Getenv("PLATFORM"),
+		jwt_secret: os.Getenv("JWT_SECRET"),
 	}
 
 	mux := http.NewServeMux()
@@ -280,6 +369,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirpHandler)
 	mux.HandleFunc("POST /api/chirps", cfg.createChirpHandler)
 	mux.HandleFunc("POST /api/login", cfg.loginHandler)
+	mux.HandleFunc("POST /api/refresh", cfg.refreshHandler)
+	mux.HandleFunc("POST /api/revoke", cfg.revokeHandler)
 	mux.HandleFunc("GET /admin/metrics", cfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", cfg.resetHandler)
 
