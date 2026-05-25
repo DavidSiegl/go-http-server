@@ -295,6 +295,98 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (cfg *apiConfig) deleteChirpHandler(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	userID, err := auth.ValidateJWT(tokenString, cfg.jwt_secret)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	chirpID, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	chirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if chirp.UserID != userID {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	if err := cfg.db.DeleteChirp(r.Context(), chirpID); err != nil {
+		log.Printf("deleteChirp error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) updateUserHandler(w http.ResponseWriter, r *http.Request) {
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	userID, err := auth.ValidateJWT(tokenString, cfg.jwt_secret)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" || req.Password == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	hashed, err := auth.HashPassword(req.Password)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not hash password"})
+		return
+	}
+
+	user, err := cfg.db.UpdateUser(r.Context(), database.UpdateUserParams{
+		ID:             userID,
+		Email:          req.Email,
+		HashedPassword: hashed,
+	})
+	if err != nil {
+		log.Printf("updateUser error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not update user"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":         user.ID,
+		"created_at": user.CreatedAt,
+		"updated_at": user.UpdatedAt,
+		"email":      user.Email,
+	})
+}
+
 func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
 	tokenString, err := auth.GetBearerToken(r.Header)
 	if err != nil {
@@ -365,9 +457,11 @@ func main() {
 	mux.Handle("/app/", cfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
 	mux.HandleFunc("GET /api/healthz", readinessHandler)
 	mux.HandleFunc("POST /api/users", cfg.createUserHandler)
+	mux.HandleFunc("PUT /api/users", cfg.updateUserHandler)
 	mux.HandleFunc("GET /api/chirps", cfg.getChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getChirpHandler)
 	mux.HandleFunc("POST /api/chirps", cfg.createChirpHandler)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.deleteChirpHandler)
 	mux.HandleFunc("POST /api/login", cfg.loginHandler)
 	mux.HandleFunc("POST /api/refresh", cfg.refreshHandler)
 	mux.HandleFunc("POST /api/revoke", cfg.revokeHandler)

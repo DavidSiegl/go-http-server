@@ -120,6 +120,79 @@ func TestResetHandler_Dev(t *testing.T) {
 	}
 }
 
+// --- update user ---
+
+func TestUpdateUserHandler_NoToken(t *testing.T) {
+	cfg, _ := newTestConfig(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/users", strings.NewReader(`{"email":"a@b.com","password":"pw"}`))
+	w := httptest.NewRecorder()
+	cfg.updateUserHandler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUpdateUserHandler_ExpiredToken(t *testing.T) {
+	cfg, _ := newTestConfig(t)
+	tok := makeToken(t, uuid.New(), -time.Second)
+	req := httptest.NewRequest(http.MethodPut, "/api/users", strings.NewReader(`{"email":"a@b.com","password":"pw"}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.updateUserHandler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUpdateUserHandler_InvalidBody(t *testing.T) {
+	cfg, _ := newTestConfig(t)
+	tok := makeToken(t, uuid.New(), time.Hour)
+	req := httptest.NewRequest(http.MethodPut, "/api/users", strings.NewReader("not json"))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.updateUserHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestUpdateUserHandler_Valid(t *testing.T) {
+	cfg, mock := newTestConfig(t)
+	userID := uuid.New()
+	now := time.Now()
+	tok := makeToken(t, userID, time.Hour)
+
+	rows := sqlmock.NewRows([]string{"id", "created_at", "updated_at", "email", "hashed_password"}).
+		AddRow(userID, now, now, "new@example.com", "hashed")
+	mock.ExpectQuery("UPDATE users").
+		WithArgs(userID, "new@example.com", sqlmock.AnyArg()).
+		WillReturnRows(rows)
+
+	payload, _ := json.Marshal(map[string]string{"email": "new@example.com", "password": "newpass"})
+	req := httptest.NewRequest(http.MethodPut, "/api/users", strings.NewReader(string(payload)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.updateUserHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["email"] != "new@example.com" {
+		t.Errorf("email = %v, want %q", resp["email"], "new@example.com")
+	}
+	if _, ok := resp["hashed_password"]; ok {
+		t.Error("response must not include hashed_password")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // --- chirps ---
 
 func TestCreateChirpHandler_NoToken(t *testing.T) {
@@ -284,6 +357,94 @@ func TestRevokeHandler_Valid(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer my-refresh-token")
 	w := httptest.NewRecorder()
 	cfg.revokeHandler(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+func TestDeleteChirpHandler_NoToken(t *testing.T) {
+	cfg, _ := newTestConfig(t)
+	req := httptest.NewRequest(http.MethodDelete, "/api/chirps/"+uuid.New().String(), nil)
+	req.SetPathValue("chirpID", uuid.New().String())
+	w := httptest.NewRecorder()
+	cfg.deleteChirpHandler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestDeleteChirpHandler_NotFound(t *testing.T) {
+	cfg, mock := newTestConfig(t)
+	userID := uuid.New()
+	chirpID := uuid.New()
+	tok := makeToken(t, userID, time.Hour)
+
+	mock.ExpectQuery("SELECT .* FROM chirps WHERE id").
+		WithArgs(chirpID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at", "body", "user_id"}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/chirps/"+chirpID.String(), nil)
+	req.SetPathValue("chirpID", chirpID.String())
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.deleteChirpHandler(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestDeleteChirpHandler_Forbidden(t *testing.T) {
+	cfg, mock := newTestConfig(t)
+	userID := uuid.New()
+	otherUserID := uuid.New()
+	chirpID := uuid.New()
+	now := time.Now()
+	tok := makeToken(t, userID, time.Hour)
+
+	rows := sqlmock.NewRows([]string{"id", "created_at", "updated_at", "body", "user_id"}).
+		AddRow(chirpID, now, now, "someone else's chirp", otherUserID)
+	mock.ExpectQuery("SELECT .* FROM chirps WHERE id").
+		WithArgs(chirpID).
+		WillReturnRows(rows)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/chirps/"+chirpID.String(), nil)
+	req.SetPathValue("chirpID", chirpID.String())
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.deleteChirpHandler(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestDeleteChirpHandler_Valid(t *testing.T) {
+	cfg, mock := newTestConfig(t)
+	userID := uuid.New()
+	chirpID := uuid.New()
+	now := time.Now()
+	tok := makeToken(t, userID, time.Hour)
+
+	rows := sqlmock.NewRows([]string{"id", "created_at", "updated_at", "body", "user_id"}).
+		AddRow(chirpID, now, now, "my chirp", userID)
+	mock.ExpectQuery("SELECT .* FROM chirps WHERE id").
+		WithArgs(chirpID).
+		WillReturnRows(rows)
+	mock.ExpectExec("DELETE FROM chirps").
+		WithArgs(chirpID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/chirps/"+chirpID.String(), nil)
+	req.SetPathValue("chirpID", chirpID.String())
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	cfg.deleteChirpHandler(w, req)
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusNoContent)
