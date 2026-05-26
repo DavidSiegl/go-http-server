@@ -30,6 +30,22 @@ func MakeRefreshToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+func GetAPIKey(headers http.Header) (string, error) {
+	auth := headers.Get("Authorization")
+	if auth == "" {
+		return "", errors.New("authorization header missing")
+	}
+	key, found := strings.CutPrefix(auth, "ApiKey ")
+	if !found {
+		return "", errors.New("authorization header must start with 'ApiKey '")
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("api key is empty")
+	}
+	return key, nil
+}
+
 func GetBearerToken(headers http.Header) (string, error) {
 	auth := headers.Get("Authorization")
 	if auth == "" {

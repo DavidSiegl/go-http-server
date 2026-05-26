@@ -24,6 +24,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	jwt_secret     string
+	polka_key      string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -62,7 +63,33 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
-	chirps, err := cfg.db.GetChirps(r.Context())
+	var chirps []database.Chirp
+	var err error
+
+	sortDesc := r.URL.Query().Get("sort") == "desc"
+	authorID := r.URL.Query().Get("author_id")
+
+	if authorID != "" {
+		parsedID, parseErr := uuid.Parse(authorID)
+		if parseErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid author_id"})
+			return
+		}
+		if sortDesc {
+			chirps, err = cfg.db.GetChirpsByAuthorDesc(r.Context(), parsedID)
+		} else {
+			chirps, err = cfg.db.GetChirpsByAuthor(r.Context(), parsedID)
+		}
+	} else {
+		if sortDesc {
+			chirps, err = cfg.db.GetChirpsDesc(r.Context())
+		} else {
+			chirps, err = cfg.db.GetChirps(r.Context())
+		}
+	}
+
 	if err != nil {
 		log.Printf("getChirps error: %v", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -219,10 +246,11 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":         user.ID,
-		"email":      user.Email,
-		"created_at": user.CreatedAt,
-		"updated_at": user.UpdatedAt,
+		"id":            user.ID,
+		"email":         user.Email,
+		"created_at":    user.CreatedAt,
+		"updated_at":    user.UpdatedAt,
+		"is_chirpy_red": user.IsChirpyRed,
 	})
 }
 
@@ -292,6 +320,7 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 		"email":         user.Email,
 		"token":         accessToken,
 		"refresh_token": rawRefresh,
+		"is_chirpy_red": user.IsChirpyRed,
 	})
 }
 
@@ -380,10 +409,11 @@ func (cfg *apiConfig) updateUserHandler(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":         user.ID,
-		"created_at": user.CreatedAt,
-		"updated_at": user.UpdatedAt,
-		"email":      user.Email,
+		"id":            user.ID,
+		"created_at":    user.CreatedAt,
+		"updated_at":    user.UpdatedAt,
+		"email":         user.Email,
+		"is_chirpy_red": user.IsChirpyRed,
 	})
 }
 
@@ -429,6 +459,44 @@ func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) polkaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || apiKey != cfg.polka_key {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if req.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	userID, err := uuid.Parse(req.Data.UserID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	_, err = cfg.db.UpgradeToChirpyRed(r.Context(), userID)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -451,6 +519,7 @@ func main() {
 		db:         database.New(db),
 		platform:   os.Getenv("PLATFORM"),
 		jwt_secret: os.Getenv("JWT_SECRET"),
+		polka_key:  os.Getenv("POLKA_KEY"),
 	}
 
 	mux := http.NewServeMux()
@@ -465,6 +534,7 @@ func main() {
 	mux.HandleFunc("POST /api/login", cfg.loginHandler)
 	mux.HandleFunc("POST /api/refresh", cfg.refreshHandler)
 	mux.HandleFunc("POST /api/revoke", cfg.revokeHandler)
+	mux.HandleFunc("POST /api/polka/webhooks", cfg.polkaWebhookHandler)
 	mux.HandleFunc("GET /admin/metrics", cfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", cfg.resetHandler)
 
